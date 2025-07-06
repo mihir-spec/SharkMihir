@@ -1,17 +1,17 @@
 """
-Premium-Sportswear App • Feasibility Workbench
-==============================================
+Premium-Sportswear App • Analytics Workbench
+===========================================
 
-Streamlit dashboard to explore the synthetic consumer-survey dataset.
+• Cleans extreme outliers (1.5×IQR) on key numeric columns
+• Uses RobustScaler for all numeric preprocessing
+• Compares 4 algorithms for classification and regression tasks
 
 Tabs
-• Overview                – distributions & correlations
-• Segments                – k-means clusters (+ scatter-matrix)
-• Willingness Classifier  – logistic model, confusion-matrix, ROC
-• Spend Regression        – linear model, actual-vs-predicted
-• Association Rules       – Apriori basket mining
-
-July 2025 edition (adds extra charts + normalised CM)
+1. Overview               – quick stats & plots
+2. Segments (k-means)     – scatter + scatter-matrix
+3. Willingness Classifier – 4 models, metrics table, best CM
+4. Spend Regression       – 4 models, metrics table, best scatter
+5. Association Rules      – Apriori market-basket
 """
 
 import streamlit as st
@@ -20,56 +20,95 @@ import numpy as np
 import plotly.express as px
 import plotly.graph_objects as go
 
-from sklearn.preprocessing import OneHotEncoder, StandardScaler
+# --- scikit-learn ---
+from sklearn.preprocessing import RobustScaler, OneHotEncoder
 from sklearn.compose import ColumnTransformer
 from sklearn.pipeline import Pipeline
 from sklearn.cluster import KMeans
-from sklearn.linear_model import LogisticRegression, LinearRegression
-from sklearn.metrics import (classification_report, confusion_matrix,
-                             roc_curve, auc, r2_score)
 from sklearn.model_selection import train_test_split
+from sklearn.metrics import (accuracy_score, f1_score, roc_auc_score,
+                             classification_report, confusion_matrix,
+                             r2_score, mean_absolute_error)
+from sklearn.linear_model import LogisticRegression, LinearRegression
+from sklearn.ensemble import (RandomForestClassifier, GradientBoostingClassifier,
+                              RandomForestRegressor, GradientBoostingRegressor)
+from sklearn.neighbors import KNeighborsClassifier, KNeighborsRegressor
+
+# --- frequent pattern mining ---
 from mlxtend.frequent_patterns import apriori, association_rules
 
+
 # ------------------------------------------------------------------ #
-# 0  App setup & data load
+# 0.   Helpers
 # ------------------------------------------------------------------ #
+
+def fmt(x, nd=2):       # nice number formatting for tables
+    return f"{x:.{nd}f}"
+
+def drop_outliers(df: pd.DataFrame, cols, k=1.5) -> pd.DataFrame:
+    """
+    Remove rows where ANY listed numeric column falls outside
+    [Q1 − k·IQR, Q3 + k·IQR].
+    """
+    clean = df.copy()
+    for c in cols:
+        q1, q3 = clean[c].quantile([0.25, 0.75])
+        iqr = q3 - q1
+        low, high = q1 - k * iqr, q3 + k * iqr
+        clean = clean[(clean[c] >= low) & (clean[c] <= high)]
+    return clean
+
+
+# ------------------------------------------------------------------ #
+# 1.   Load data + clean
+# ------------------------------------------------------------------ #
+
 st.set_page_config(page_title="Sportswear-App Analytics", layout="wide")
 
 upl = st.sidebar.file_uploader("Upload survey CSV "
-                               "(leave empty to use bundled sample)",
+                               "(or leave empty to use bundled sample)",
                                type=["csv"])
 
 @st.cache_data(show_spinner=False)
 def load_csv(path: str) -> pd.DataFrame:
     return pd.read_csv(path)
 
-df = load_csv(upl) if upl else load_csv("sportswear_survey_synthetic.csv")
+raw_df = load_csv(upl) if upl else load_csv("sportswear_survey_synthetic.csv")
+
+num_cols_for_clean = ["Q1_Age", "Q5_MonthlyIncome",
+                      "Q10_HoursPerWeek", "Q13_SpendLast12Months"]
+
+df = drop_outliers(raw_df, num_cols_for_clean)   # <- outliers removed
+st.sidebar.info(f"Rows after cleaning: **{len(df)}** "
+                f"(dropped {len(raw_df) - len(df)})")
 
 st.title("🏅 Premium-Sportswear – Analytics Workbench")
 
+
 # ------------------------------------------------------------------ #
-# 1  Tabs
+# 2.   Tabs
 # ------------------------------------------------------------------ #
+
 tab_ov, tab_seg, tab_cls, tab_reg, tab_rule = st.tabs(
     ["Overview", "Segments", "Willingness Classifier",
      "Spend Regression", "Association Rules"]
 )
 
+
 # ------------------------------------------------------------------ #
-# 2  Overview
+# 2a. Overview tab
 # ------------------------------------------------------------------ #
 with tab_ov:
     st.subheader("Snapshot")
     c1, c2, c3 = st.columns(3)
-    c1.metric("Rows",              f"{len(df):,}")
+    c1.metric("Rows", f"{len(df):,}")
     c2.metric("High-Intent users", df["HighIntent"].sum())
-    c3.metric("Countries",         df["Q3_Country"].nunique())
+    c3.metric("Countries", df["Q3_Country"].nunique())
 
     # Age distribution
-    st.plotly_chart(
-        px.histogram(df, x="Q1_Age", nbins=30, title="Age distribution"),
-        use_container_width=True
-    )
+    st.plotly_chart(px.histogram(df, x="Q1_Age", nbins=30,
+                                 title="Age distribution"),
+                    use_container_width=True)
 
     # Gender pie
     st.plotly_chart(
@@ -80,18 +119,16 @@ with tab_ov:
         use_container_width=True
     )
 
-    # Brands bar chart (exploded)
+    # Brands bar
     brands_ex = (
-        df["Q17_BrandsBought"]
-          .str.split(",", expand=True)
+        df["Q17_BrandsBought"].str.split(",", expand=True)
           .stack().str.strip()
           .replace("", np.nan).dropna()
           .rename("Brand")
     )
-    st.plotly_chart(
-        px.histogram(brands_ex, x="Brand", title="Brands bought (count)"),
-        use_container_width=True
-    )
+    st.plotly_chart(px.histogram(brands_ex, x="Brand",
+                                 title="Brands bought (count)"),
+                    use_container_width=True)
 
     # Income vs Spend scatter
     st.plotly_chart(
@@ -103,29 +140,27 @@ with tab_ov:
     )
 
     # Correlation heat-map
-    num_cols = ["Q1_Age", "Q5_MonthlyIncome", "Q10_HoursPerWeek",
-                "Q13_SpendLast12Months", "Q8_SportsCount"]
-    st.plotly_chart(
-        px.imshow(df[num_cols].corr(), text_auto=True,
-                  title="Correlation matrix (numeric features)"),
-        use_container_width=True
-    )
+    corr_cols = ["Q1_Age", "Q5_MonthlyIncome",
+                 "Q10_HoursPerWeek", "Q13_SpendLast12Months",
+                 "Q8_SportsCount"]
+    st.plotly_chart(px.imshow(df[corr_cols].corr(), text_auto=True,
+                              title="Correlation matrix (numeric features)"),
+                    use_container_width=True)
 
     # Sports practised histogram
     sports_ex = (
-        df["Q9_SportsPractised"]
-          .str.split(",", expand=True)
+        df["Q9_SportsPractised"].str.split(",", expand=True)
           .stack().str.strip()
           .replace("", np.nan).dropna()
           .rename("Sport")
     )
-    st.plotly_chart(
-        px.histogram(sports_ex, x="Sport", title="Sports practised"),
-        use_container_width=True
-    )
+    st.plotly_chart(px.histogram(sports_ex, x="Sport",
+                                 title="Sports practised"),
+                    use_container_width=True)
+
 
 # ------------------------------------------------------------------ #
-# 3  Segments – k-means
+# 2b. Segments tab
 # ------------------------------------------------------------------ #
 with tab_seg:
     st.subheader("Consumer Segments – k-means")
@@ -135,13 +170,12 @@ with tab_seg:
 
     k = st.slider("k (clusters)", 2, 8, 4)
     km = KMeans(n_clusters=k, n_init="auto", random_state=42)
-    df["Cluster"] = km.fit_predict(
-        StandardScaler().fit_transform(df[vars_km])
-    )
+    df["Cluster"] = km.fit_predict(RobustScaler().fit_transform(df[vars_km]))
 
-    # Scatter Age × Income
+    # Scatter age × income
     st.plotly_chart(
-        px.scatter(df, x="Q1_Age", y="Q5_MonthlyIncome", color="Cluster",
+        px.scatter(df, x="Q1_Age", y="Q5_MonthlyIncome",
+                   color="Cluster",
                    hover_data=["Q13_SpendLast12Months"]),
         use_container_width=True
     )
@@ -157,13 +191,13 @@ with tab_seg:
     st.markdown("**Cluster means**")
     st.dataframe(df.groupby("Cluster")[vars_km].mean().round(1))
 
+
 # ------------------------------------------------------------------ #
-# 4  Willingness Classifier
+# 2c. Willingness Classifier tab  (4 algorithms)
 # ------------------------------------------------------------------ #
 with tab_cls:
     st.subheader("Predict High-Intent adoption")
 
-    # Feature lists
     num = ["Q1_Age", "Q5_MonthlyIncome", "Q10_HoursPerWeek",
            "Q13_SpendLast12Months"]
     cat = ["Q2_Gender", "Q3_Country", "Q14_FreqBuyOnline",
@@ -172,113 +206,6 @@ with tab_cls:
     X, y = df[num + cat], df["HighIntent"]
 
     test_size = st.slider("Test-set size", 0.1, 0.5, 0.2, 0.05)
-    stratify  = st.checkbox("Stratify split", True)
+    stratify  = st.checkbox("Stratify split", value=True)
     X_tr, X_te, y_tr, y_te = train_test_split(
-        X, y, test_size=test_size, random_state=42,
-        stratify=y if stratify else None
-    )
-
-    pipe = Pipeline([
-        ("prep", ColumnTransformer([
-            ("num", StandardScaler(), num),
-            ("cat", OneHotEncoder(handle_unknown="ignore"), cat)
-        ])),
-        ("clf",  LogisticRegression(max_iter=1000))
-    ]).fit(X_tr, y_tr)
-
-    y_pred  = pipe.predict(X_te)
-    y_prob  = pipe.predict_proba(X_te)[:, 1]
-
-    st.code(classification_report(y_te, y_pred), language="text")
-
-    # Confusion matrix
-    cm  = confusion_matrix(y_te, y_pred, labels=[0, 1])
-    cmn = cm / cm.sum(axis=1, keepdims=True)
-
-    mode = st.radio("Confusion matrix view:",
-                    ["Counts", "Normalised"], horizontal=True)
-    mat  = cm if mode == "Counts" else cmn
-    fmt  = "d" if mode == "Counts" else ".2f"
-
-    st.plotly_chart(
-        px.imshow(mat, text_auto=fmt, color_continuous_scale="Blues",
-                  x=["Pred 0", "Pred 1"], y=["True 0", "True 1"],
-                  title=f"Confusion matrix – {mode.lower()}"),
-        use_container_width=True
-    )
-
-    # ROC curve
-    fpr, tpr, _ = roc_curve(y_te, y_prob)
-    fig_roc = go.Figure()
-    fig_roc.add_scatter(x=fpr, y=tpr, mode="lines",
-                        name=f"AUC = {auc(fpr,tpr):.2f}")
-    fig_roc.add_scatter(x=[0,1], y=[0,1], mode="lines",
-                        line=dict(dash="dash"), showlegend=False)
-    fig_roc.update_layout(title="ROC curve",
-                          xaxis_title="False-positive rate",
-                          yaxis_title="True-positive rate")
-    st.plotly_chart(fig_roc, use_container_width=True)
-
-# ------------------------------------------------------------------ #
-# 5  Spend Regression
-# ------------------------------------------------------------------ #
-with tab_reg:
-    st.subheader("Predict Annual sportswear spend")
-
-    target = "Q13_SpendLast12Months"
-    preds  = ["Q5_MonthlyIncome", "Q8_SportsCount", "Q10_HoursPerWeek",
-              "Q25_AppealSingleCart"]
-
-    pipe_r = Pipeline([
-        ("sc", StandardScaler()),
-        ("lr", LinearRegression())
-    ]).fit(df[preds], df[target])
-
-    y_hat = pipe_r.predict(df[preds])
-    st.write(f"**R² (in-sample)** = {r2_score(df[target], y_hat):.2f}")
-
-    st.plotly_chart(
-        px.scatter(x=df[target], y=y_hat,
-                   labels={"x": "Actual spend",
-                           "y": "Predicted"},
-                   title="Actual vs Predicted"),
-        use_container_width=True
-    )
-
-# ------------------------------------------------------------------ #
-# 6  Association Rules
-# ------------------------------------------------------------------ #
-with tab_rule:
-    st.subheader("Market-basket insights")
-
-    mapping = {"Sports practised": "Q9_SportsPractised",
-               "Brands bought":    "Q17_BrandsBought"}
-    choice = st.selectbox("Multi-select column", list(mapping.keys()))
-    col    = mapping[choice]
-
-    # Robust parsing
-    series = (
-        df[col].fillna("")
-              .apply(lambda s: [x.strip() for x in s.split(",") if x.strip()])
-    )
-
-    basket = (
-        series.explode()           # one item per row
-              .pipe(pd.get_dummies)
-              .groupby(level=0).max()
-              .astype(int)
-    )
-
-    if basket.empty or basket.sum().sum() == 0:
-        st.warning("No items present.")
-    else:
-        freq  = apriori(basket, min_support=0.05, use_colnames=True)
-        rules = association_rules(freq, metric="lift", min_threshold=1.2)
-
-        if rules.empty:
-            st.info("No association rules above thresholds.")
-        else:
-            st.dataframe(
-                rules.sort_values("lift", ascending=False).head(15),
-                height=400
-            )
+        X, y, test_size=test_size, random_stat_
