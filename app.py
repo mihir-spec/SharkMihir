@@ -1,9 +1,10 @@
 """
 Premium-Sportswear App • Analytics Workbench
--------------------------------------------
-• Removes outliers via Robust-Scaling (>3×IQR from median)
-• Compares 4 classifiers & 4 regressors
-• Shows best-model confusion matrix / scatter + feature importance
+===========================================
+
+• Robust-scales numeric features & drops outliers (|z|>3)
+• Tests 4 classifiers + 4 regressors
+• Shows best-model confusion matrix, ROC curve, feature importance
 """
 
 import streamlit as st
@@ -18,16 +19,12 @@ from sklearn.compose import ColumnTransformer
 from sklearn.pipeline import Pipeline
 from sklearn.model_selection import train_test_split
 from sklearn.metrics import (accuracy_score, f1_score, roc_auc_score,
-                             classification_report, confusion_matrix,
-                             r2_score, mean_absolute_error)
-# classifiers
-from sklearn.neighbors import KNeighborsClassifier
-from sklearn.tree import DecisionTreeClassifier
+                             roc_curve, confusion_matrix, r2_score,
+                             mean_absolute_error)
+from sklearn.neighbors import KNeighborsClassifier, KNeighborsRegressor
+from sklearn.tree import DecisionTreeClassifier, DecisionTreeRegressor
 from sklearn.ensemble import RandomForestClassifier, GradientBoostingClassifier
-# regressors
 from sklearn.linear_model import LinearRegression, Ridge, Lasso
-from sklearn.tree import DecisionTreeRegressor
-# clustering
 from sklearn.cluster import KMeans
 
 # market-basket
@@ -37,21 +34,16 @@ from mlxtend.frequent_patterns import apriori, association_rules
 # ─── Helpers ─────────────────────────────────────────────────────
 def fmt(x, nd=2): return f"{x:.{nd}f}"
 
-def robust_outlier_remove(df: pd.DataFrame, cols, thr=3.0):
-    """
-    Fit RobustScaler on 'cols', transform, and drop any row where the
-    absolute scaled value of ANY column exceeds 'thr'.
-    """
-    scaler = RobustScaler()
-    scaled = scaler.fit_transform(df[cols])
-    mask = (np.abs(scaled) <= thr).all(axis=1)
-    return df.loc[mask].reset_index(drop=True)
+def robust_outlier_remove(df, cols, thr=3.0):
+    """Drop rows where |robust-scaled value| > thr for ANY column."""
+    rs = RobustScaler().fit_transform(df[cols])
+    keep = (np.abs(rs) <= thr).all(axis=1)
+    return df.loc[keep].reset_index(drop=True)
 
-def get_ohe_feature_names(ct: ColumnTransformer):
-    """Return list of feature names after ColumnTransformer."""
+def ohe_feature_names(ct):
+    """Return full list of feature names after ColumnTransformer."""
     names = []
-    for name, trans, cols in ct.transformers_:
-        if name == "remainder": continue
+    for _, trans, cols in ct.transformers_:
         if hasattr(trans, "get_feature_names_out"):
             names.extend(trans.get_feature_names_out(cols))
         else:
@@ -61,20 +53,18 @@ def get_ohe_feature_names(ct: ColumnTransformer):
 
 # ─── Load & clean data ───────────────────────────────────────────
 st.set_page_config(page_title="Sportswear-App Analytics", layout="wide")
+upl = st.sidebar.file_uploader("Upload survey CSV (or leave blank)", type=["csv"])
 
-upl = st.sidebar.file_uploader("Upload survey CSV (or leave blank for demo)",
-                               type=["csv"])
 @st.cache_data(show_spinner=False)
 def load_csv(p): return pd.read_csv(p)
 
-raw_df = load_csv(upl) if upl else load_csv("sportswear_survey_synthetic.csv")
+raw = load_csv(upl) if upl else load_csv("sportswear_survey_synthetic.csv")
 
-num_for_clean = ["Q1_Age", "Q5_MonthlyIncome",
-                 "Q10_HoursPerWeek", "Q13_SpendLast12Months"]
-
-df = robust_outlier_remove(raw_df, num_for_clean, thr=3.0)
+num_clean = ["Q1_Age", "Q5_MonthlyIncome", "Q10_HoursPerWeek",
+             "Q13_SpendLast12Months"]
+df = robust_outlier_remove(raw, num_clean, thr=3.0)
 st.sidebar.info(f"Rows after outlier removal: **{len(df)}** "
-                f"(dropped {len(raw_df) - len(df)})")
+                f"(dropped {len(raw)-len(df)})")
 
 st.title("🏅 Premium-Sportswear — Analytics Workbench")
 
@@ -92,15 +82,13 @@ with tab_ov:
     st.plotly_chart(px.histogram(df, x="Q1_Age", nbins=30,
                                  title="Age distribution"),
                     use_container_width=True)
-
     st.plotly_chart(
-        px.pie(df, names="Q2_Gender", hole=.4,
-               title="Gender split").update_traces(textinfo="percent+label"),
+        px.pie(df, names="Q2_Gender", hole=.4, title="Gender split")
+          .update_traces(textinfo="percent+label"),
         use_container_width=True)
 
     brands = (df["Q17_BrandsBought"].str.split(",", expand=True)
-                .stack().str.strip()
-                .replace("", np.nan).dropna())
+                .stack().str.strip().replace("", np.nan).dropna())
     st.plotly_chart(px.histogram(brands, x=0, title="Brands bought"),
                     use_container_width=True)
 
@@ -125,63 +113,86 @@ with tab_seg:
 # ─── 3. Classifier ──────────────────────────────────────────────
 with tab_cls:
     st.subheader("High-Intent Classifier")
+
     num = ["Q1_Age","Q5_MonthlyIncome","Q10_HoursPerWeek",
            "Q13_SpendLast12Months"]
     cat = ["Q2_Gender","Q3_Country","Q14_FreqBuyOnline",
            "Q17_BrandsBought","Q25_AppealSingleCart"]
     X,y = df[num+cat], df["HighIntent"]
+
     ts = st.slider("Test size",0.1,0.5,0.2,0.05)
-    X_tr,X_te,y_tr,y_te = train_test_split(X,y,test_size=ts,
-                                           stratify=y, random_state=42)
+    X_tr, X_te, y_tr, y_te = train_test_split(
+        X, y, test_size=ts, stratify=y, random_state=42)
 
     models = {
         "KNN": KNeighborsClassifier(n_neighbors=10),
         "DecisionTree": DecisionTreeClassifier(random_state=42),
-        "RandomForest": RandomForestClassifier(n_estimators=300, random_state=42),
+        "RandomForest": RandomForestClassifier(n_estimators=300,
+                                               random_state=42),
         "GradientBoost": GradientBoostingClassifier(random_state=42)
     }
 
-    rows, best_auc, best_pipe, best_name = [],0,None,""
+    rows, best_auc, best_pipe, best_name = [], 0, None, ""
     for name, clf in models.items():
         prep = ColumnTransformer([
-            ("num",RobustScaler(),num),
-            ("cat",OneHotEncoder(handle_unknown="ignore"),cat)
+            ("num", RobustScaler(), num),
+            ("cat", OneHotEncoder(handle_unknown="ignore"), cat)
         ])
-        pipe = Pipeline([("prep",prep),("clf",clf)]).fit(X_tr,y_tr)
+        pipe = Pipeline([("prep", prep), ("clf", clf)]).fit(X_tr, y_tr)
+
         y_pred = pipe.predict(X_te)
-        proba = (pipe.predict_proba(X_te)[:,1]
-                 if hasattr(pipe,"predict_proba") else np.zeros_like(y_pred))
+        proba  = (pipe.predict_proba(X_te)[:,1]
+                  if hasattr(pipe, "predict_proba")
+                  else np.zeros_like(y_pred))
         auc = roc_auc_score(y_te, proba)
+
         rows.append({"Model":name,
-                     "Acc":fmt(accuracy_score(y_te,y_pred),3),
+                     "Acc":fmt(accuracy_score(y_te, y_pred),3),
                      "F1":fmt(f1_score(y_te,y_pred),3),
                      "ROC-AUC":fmt(auc,3)})
-        if auc>best_auc:
-            best_auc,best_pipe,best_name = auc,pipe,name
+        if auc > best_auc:
+            best_auc, best_pipe, best_name = auc, pipe, name
 
     st.dataframe(pd.DataFrame(rows).set_index("Model"))
     st.markdown(f"**Best:** `{best_name}` (AUC {fmt(best_auc,3)})")
 
+    # Confusion matrix
     cm = confusion_matrix(y_te, best_pipe.predict(X_te))
     st.plotly_chart(px.imshow(cm, text_auto=True, color_continuous_scale="Blues",
                               x=["Pred 0","Pred 1"], y=["True 0","True 1"],
                               title=f"Confusion – {best_name}"),
                     use_container_width=True)
 
+    # ROC curve  ⬅️ NEW
+    if hasattr(best_pipe, "predict_proba"):
+        y_prob = best_pipe.predict_proba(X_te)[:,1]
+    else:                                  # KNN etc. always have predict_proba; safeguard
+        y_prob = np.zeros_like(y_te)
+    fpr, tpr, _ = roc_curve(y_te, y_prob)
+    roc_fig = go.Figure()
+    roc_fig.add_scatter(x=fpr, y=tpr, mode="lines",
+                        name=f"AUC {fmt(best_auc,3)}")
+    roc_fig.add_scatter(x=[0,1], y=[0,1], mode="lines",
+                        line=dict(dash="dash"), showlegend=False)
+    roc_fig.update_layout(title=f"ROC curve – {best_name}",
+                          xaxis_title="False positive rate",
+                          yaxis_title="True positive rate")
+    st.plotly_chart(roc_fig, use_container_width=True)
+
     # Feature importance
     st.markdown("#### Feature importance")
     prep = best_pipe.named_steps["prep"]
-    feat_names = get_ohe_feature_names(prep)
+    feat_names = ohe_feature_names(prep)
     clf = best_pipe.named_steps["clf"]
-    if hasattr(clf,"feature_importances_"):
+    if hasattr(clf, "feature_importances_"):
         imp = pd.Series(clf.feature_importances_, index=feat_names)
-    elif hasattr(clf,"coef_"):
+    elif hasattr(clf, "coef_"):
         imp = pd.Series(np.abs(clf.coef_).ravel(), index=feat_names)
     else:
         imp = pd.Series(dtype=float)
 
     if imp.empty:
-        st.info("Model provides no importance scores.")
+        st.info("Model does not expose importances.")
     else:
         top = imp.sort_values(ascending=False).head(15)
         st.plotly_chart(px.bar(top, orientation="h",
@@ -203,15 +214,16 @@ with tab_reg:
         "DecTree": DecisionTreeRegressor(random_state=42)
     }
 
-    rows, best_r2,best_pipe,best_name = [],-1,None,""
-    for n,r in regs.items():
-        pipe = Pipeline([("sc",RobustScaler()),("reg",r)]).fit(df[feats],df[target])
+    rows, best_r2,best_pipe,best_name = [], -1, None, ""
+    for name, reg in regs.items():
+        pipe = Pipeline([("sc", RobustScaler()), ("reg", reg)]
+                        ).fit(df[feats], df[target])
         pred = pipe.predict(df[feats])
         r2  = r2_score(df[target], pred)
         mae = mean_absolute_error(df[target], pred)
-        rows.append({"Model":n,"R²":fmt(r2,3),"MAE":fmt(mae,0)})
-        if r2>best_r2:
-            best_r2,best_pipe,best_name = r2,pipe,n
+        rows.append({"Model":name,"R²":fmt(r2,3),"MAE":fmt(mae,0)})
+        if r2 > best_r2:
+            best_r2, best_pipe, best_name = r2, pipe, name
 
     st.dataframe(pd.DataFrame(rows).set_index("Model"))
     st.markdown(f"**Best:** `{best_name}` (R² {fmt(best_r2,3)})")
@@ -231,7 +243,7 @@ with tab_reg:
         imp = pd.Series(dtype=float)
 
     if imp.empty:
-        st.info("Regressor provides no importance scores.")
+        st.info("Regressor has no importance scores.")
     else:
         st.plotly_chart(px.bar(imp.sort_values(), orientation="h",
                                title="Feature importance"),
@@ -245,14 +257,14 @@ with tab_rule:
     choice = st.selectbox("Column", list(mapping.keys()))
     col = mapping[choice]
     series = (df[col].fillna("")
-                    .apply(lambda s:[x.strip() for x in s.split(",") if x.strip()]))
+              .apply(lambda s:[x.strip() for x in s.split(",") if x.strip()]))
     basket = (series.explode()
                      .pipe(pd.get_dummies)
                      .groupby(level=0).max().astype(int))
     if basket.sum().sum()==0:
         st.info("No items present.")
     else:
-        freq  = apriori(basket,min_support=0.05,use_colnames=True)
-        rules = association_rules(freq,metric="lift",min_threshold=1.2)
-        st.dataframe(rules.sort_values("lift",ascending=False).head(15),
+        freq  = apriori(basket, min_support=0.05, use_colnames=True)
+        rules = association_rules(freq, metric="lift", min_threshold=1.2)
+        st.dataframe(rules.sort_values("lift", ascending=False).head(15),
                      height=400)
